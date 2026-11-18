@@ -1,0 +1,783 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>منصة تحليل البيانات الذكية | Data Analysis Studio</title>
+  
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            cairo: ['Cairo', 'sans-serif'],
+          },
+          colors: {
+            navy: { 800: '#1e293b', 900: '#0f172a' },
+            teal: { 500: '#14b8a6', 600: '#0d9488', 700: '#0f766e' }
+          }
+        }
+      }
+    }
+  </script>
+
+  <!-- External Libraries CDN -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://unpkg.com/lucide@latest"></script>
+
+  <style>
+    body { font-family: 'Cairo', sans-serif; }
+    @media print {
+      .no-print { display: none !important; }
+      .print-only { display: block !important; }
+      body { background: white; color: black; }
+      .page-break { page-break-before: always; }
+    }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-900 antialiased selection:bg-teal-500 selection:text-white">
+  <div id="root"></div>
+
+  <script>
+    const e = React.createElement;
+    const { useState, useEffect, useMemo, useRef } = React;
+
+    // --- UTILITY FUNCTIONS & STATISTICAL ENGINES ---
+
+    function parseArabicNumber(val) {
+      if (typeof val === 'number') return val;
+      if (!val) return NaN;
+      const str = String(val)
+        .replace(/[٠١٢٣٤٥٦٧٨٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d))
+        .replace(/٫/g, '.')
+        .replace(/,/g, '')
+        .trim();
+      return parseFloat(str);
+    }
+
+    function detectType(values) {
+      const nonNulls = values.filter(v => v !== null && v !== undefined && String(v).trim() !== '');
+      if (nonNulls.length === 0) return 'string';
+
+      let numCount = 0;
+      let dateCount = 0;
+      let boolCount = 0;
+
+      nonNulls.forEach(v => {
+        const parsedNum = parseArabicNumber(v);
+        if (!isNaN(parsedNum) && typeof parsedNum === 'number') numCount++;
+
+        const dateTest = new Date(v);
+        if (!isNaN(dateTest.getTime()) && String(v).length > 4 && /[/-]/.test(String(v))) dateCount++;
+
+        if (typeof v === 'boolean' || ['true', 'false', 'نعم', 'لا'].includes(String(v).toLowerCase())) boolCount++;
+      });
+
+      const total = nonNulls.length;
+      if (numCount / total > 0.75) return 'number';
+      if (dateCount / total > 0.75) return 'date';
+      if (boolCount / total > 0.75) return 'boolean';
+      return 'string';
+    }
+
+    function calculateStats(numbers) {
+      const valid = numbers.map(parseArabicNumber).filter(v => !isNaN(v));
+      if (valid.length === 0) return null;
+
+      const n = valid.length;
+      const sum = valid.reduce((a, b) => a + b, 0);
+      const mean = sum / n;
+
+      const sorted = [...valid].sort((a, b) => a - b);
+      const min = sorted[0];
+      const max = sorted[n - 1];
+
+      // Median calculation (Interpolated)
+      let median;
+      const mid = Math.floor(n / 2);
+      if (n % 2 === 0) {
+        median = (sorted[mid - 1] + sorted[mid]) / 2;
+      } else {
+        median = sorted[mid];
+      }
+
+      // Quartiles (R7 / Excel method approximation)
+      const q1 = sorted[Math.floor(n * 0.25)];
+      const q3 = sorted[Math.floor(n * 0.75)];
+      const iqr = q3 - q1;
+
+      // Variance & StdDev
+      const variance = valid.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / (n > 1 ? n - 1 : 1);
+      const stdDev = Math.sqrt(variance);
+
+      // Mode
+      const freq = {};
+      let maxFreq = 0;
+      let mode = sorted[0];
+      valid.forEach(v => {
+        freq[v] = (freq[v] || 0) + 1;
+        if (freq[v] > maxFreq) {
+          maxFreq = freq[v];
+          mode = v;
+        }
+      });
+
+      // Outliers detection (IQR rule)
+      const lowerFence = q1 - 1.5 * iqr;
+      const upperFence = q3 + 1.5 * iqr;
+      const outliers = valid.filter(v => v < lowerFence || v > upperFence);
+
+      return { n, sum, mean, median, min, max, q1, q3, iqr, variance, stdDev, mode, outliersCount: outliers.length };
+    }
+
+    function processRawDataset(fileName, rawData) {
+      const rowCount = rawData.length;
+      if (rowCount === 0) return null;
+
+      const cols = Object.keys(rawData[0] || {});
+      let totalMissing = 0;
+      const seenRows = new Set();
+      let duplicatesCount = 0;
+
+      rawData.forEach(row => {
+        const str = JSON.stringify(row);
+        if (seenRows.has(str)) duplicatesCount++;
+        else seenRows.add(str);
+      });
+
+      const columnsInfo = cols.map(colName => {
+        const values = rawData.map(r => r[colName]);
+        const missingCount = values.filter(v => v === null || v === undefined || String(v).trim() === '').length;
+        totalMissing += missingCount;
+
+        const uniqueVals = new Set(values.filter(v => v !== null && v !== undefined && String(v).trim() !== ''));
+        const type = detectType(values);
+
+        let stats = null;
+        if (type === 'number') {
+          stats = calculateStats(values);
+        }
+
+        return {
+          name: colName,
+          type,
+          missingCount,
+          uniqueCount: uniqueVals.size,
+          stats
+        };
+      });
+
+      const totalCells = rowCount * cols.length;
+      const qualityScore = totalCells > 0 ? Math.max(0, Math.round(100 - ((totalMissing + (duplicatesCount * cols.length)) / totalCells) * 100)) : 100;
+
+      return {
+        id: 'ds_' + Math.random().toString(36).substring(2, 9),
+        name: fileName,
+        fileName,
+        rowCount,
+        columnCount: cols.length,
+        columns: columnsInfo,
+        data: rawData,
+        qualityScore,
+        duplicatesCount,
+        totalMissing
+      };
+    }
+
+    // --- DEMO DATA GENERATOR ---
+    function generateDemoDataset() {
+      const regions = ['الرياض', 'جدة', 'الدمام', 'مكة المكرمة', 'المدينة المنورة'];
+      const categories = ['إلكترونيات', 'مستلزمات مكتبية', 'أثاث', 'خدمات صحية'];
+      const demoData = [];
+
+      for (let i = 1; i <= 150; i++) {
+        const sales = Math.floor(Math.random() * 8000) + 1200;
+        const profit = Math.floor(sales * (Math.random() * 0.35 + 0.05));
+        const missingTest = i % 15 === 0 ? null : regions[Math.floor(Math.random() * regions.length)];
+        const date = new Date(2025, Math.floor(Math.random() * 12), Math.floor(Math.random() * 28) + 1).toISOString().split('T')[0];
+
+        demoData.push({
+          'معرف العملية': `TRX-${1000 + i}`,
+          'التاريخ': date,
+          'المنطقة': missingTest,
+          'الفئة': categories[Math.floor(Math.random() * categories.length)],
+          'المبيعات (SAR)': sales,
+          'الربح (SAR)': profit,
+          'عدد الوحدات': Math.floor(Math.random() * 20) + 1
+        });
+      }
+
+      // Add intentional duplicate
+      demoData.push({ ...demoData[0] });
+
+      return processRawDataset('عينة_المبيعات_التجريبية.xlsx', demoData);
+    }
+
+    // --- MAIN REACT APPLICATION ---
+    function App() {
+      const [datasets, setDatasets] = useState([]);
+      const [activeDatasetId, setActiveDatasetId] = useState(null);
+      const [currentTab, setCurrentTab] = useState('dashboard');
+      const [isLoading, setIsLoading] = useState(false);
+      const [searchTerm, setSearchTerm] = useState('');
+
+      // Custom Chart Controls
+      const [chartType, setChartType] = useState('bar');
+      const [xAxisCol, setXAxisCol] = useState('');
+      const [yAxisCol, setYAxisCol] = useState('');
+
+      // Merging Modal Controls
+      const [showMergeModal, setShowMergeModal] = useState(false);
+      const [mergeType, setMergeType] = useState('append');
+      const [ds1Id, setDs1Id] = useState('');
+      const [ds2Id, setDs2Id] = useState('');
+      const [joinKey, setJoinKey] = useState('');
+
+      const activeDataset = useMemo(() => {
+        return datasets.find(d => d.id === activeDatasetId) || datasets[0] || null;
+      }, [datasets, activeDatasetId]);
+
+      // Set default chart columns on active dataset change
+      useEffect(() => {
+        if (activeDataset) {
+          const cat = activeDataset.columns.find(c => c.type === 'string' || c.type === 'date');
+          const num = activeDataset.columns.find(c => c.type === 'number');
+          if (cat) setXAxisCol(cat.name);
+          if (num) setYAxisCol(num.name);
+        }
+      }, [activeDatasetId]);
+
+      // Handle File Uploads
+      const handleFileUpload = async (files) => {
+        setIsLoading(true);
+        const newDatasets = [];
+
+        for (const file of files) {
+          const ext = file.name.split('.').pop().toLowerCase();
+          try {
+            if (ext === 'csv') {
+              const text = await file.text();
+              const parsed = Papa.parse(text, { header: true, dynamicTyping: true, skipEmptyLines: true });
+              if (parsed.data && parsed.data.length > 0) {
+                const ds = processRawDataset(file.name, parsed.data);
+                if (ds) newDatasets.push(ds);
+              }
+            } else if (['xlsx', 'xls'].includes(ext)) {
+              const buffer = await file.arrayBuffer();
+              const wb = XLSX.read(buffer, { type: 'array' });
+              wb.SheetNames.forEach(sheetName => {
+                const raw = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { defval: null });
+                if (raw.length > 0) {
+                  const dsName = wb.SheetNames.length > 1 ? `${file.name} (${sheetName})` : file.name;
+                  const ds = processRawDataset(dsName, raw);
+                  if (ds) newDatasets.push(ds);
+                }
+              });
+            }
+          } catch (err) {
+            console.error('File reading error:', err);
+            alert(`فشل قراءة الملف: ${file.name}`);
+          }
+        }
+
+        if (newDatasets.length > 0) {
+          setDatasets(prev => [...prev, ...newDatasets]);
+          setActiveDatasetId(newDatasets[0].id);
+        }
+        setIsLoading(false);
+      };
+
+      // Load Demo Data
+      const handleLoadDemo = () => {
+        const demo = generateDemoDataset();
+        setDatasets([demo]);
+        setActiveDatasetId(demo.id);
+      };
+
+      // Cleaning Handler
+      const handleCleanData = (options) => {
+        if (!activeDataset) return;
+        let cleaned = [...activeDataset.data];
+
+        if (options.removeDuplicates) {
+          const seen = new Set();
+          cleaned = cleaned.filter(row => {
+            const str = JSON.stringify(row);
+            if (seen.has(str)) return false;
+            seen.add(str);
+            return true;
+          });
+        }
+
+        if (options.handleMissing) {
+          cleaned = cleaned.map(row => {
+            const newRow = { ...row };
+            activeDataset.columns.forEach(col => {
+              if (newRow[col.name] === null || newRow[col.name] === undefined || String(newRow[col.name]).trim() === '') {
+                if (col.type === 'number' && col.stats) {
+                  newRow[col.name] = Number(col.stats.mean.toFixed(2));
+                } else if (col.type === 'string') {
+                  newRow[col.name] = 'غير محدد';
+                }
+              }
+            });
+            return newRow;
+          });
+        }
+
+        const updatedDS = processRawDataset(`منظف_${activeDataset.fileName}`, cleaned);
+        setDatasets(prev => prev.map(d => d.id === activeDataset.id ? updatedDS : d));
+        alert('تم تطبيق تنظيف البيانات وإعادة حساب المقاييس الإحصائية بنجاح!');
+      };
+
+      // Merging Handler
+      const handleExecuteMerge = () => {
+        const d1 = datasets.find(d => d.id === ds1Id);
+        const d2 = datasets.find(d => d.id === ds2Id);
+
+        if (!d1 || !d2) {
+          alert('يرجى اختيار ملفين صالحين للدمج.');
+          return;
+        }
+
+        let mergedData = [];
+        let mergedName = '';
+
+        if (mergeType === 'append') {
+          mergedData = [...d1.data, ...d2.data];
+          mergedName = `إلحاق_${d1.name}_${d2.name}.xlsx`;
+        } else if (['inner', 'left'].includes(mergeType)) {
+          if (!joinKey) {
+            alert('يرجى اختيار عمود الربط المشترك.');
+            return;
+          }
+
+          const mapD2 = new Map();
+          d2.data.forEach(r => mapD2.set(String(r[joinKey]), r));
+
+          d1.data.forEach(r1 => {
+            const keyVal = String(r1[joinKey]);
+            const matchD2 = mapD2.get(keyVal);
+
+            if (matchD2) {
+              mergedData.push({ ...r1, ...matchD2 });
+            } else if (mergeType === 'left') {
+              mergedData.push({ ...r1 });
+            }
+          });
+          mergedName = `ربط_${mergeType}_${d1.name}_${d2.name}.xlsx`;
+        }
+
+        const newDs = processRawDataset(mergedName, mergedData);
+        if (newDs) {
+          setDatasets(prev => [...prev, newDs]);
+          setActiveDatasetId(newDs.id);
+          setShowMergeModal(false);
+          alert('تم دمج البيانات بنجاح وإنشاء مجموعة بيانات جديدة!');
+        }
+      };
+
+      // Filtered Dataset Rows
+      const filteredRows = useMemo(() => {
+        if (!activeDataset) return [];
+        if (!searchTerm) return activeDataset.data;
+        return activeDataset.data.filter(row =>
+          Object.values(row).some(val => String(val || '').toLowerCase().includes(searchTerm.toLowerCase()))
+        );
+      }, [activeDataset, searchTerm]);
+
+      // Analytical Chart Data Builder
+      const chartData = useMemo(() => {
+        if (!activeDataset || !xAxisCol || !yAxisCol) return [];
+        const groups = {};
+
+        filteredRows.forEach(row => {
+          const xVal = String(row[xAxisCol] || 'غير محدد');
+          const yVal = parseArabicNumber(row[yAxisCol]) || 0;
+          groups[xVal] = (groups[xVal] || 0) + yVal;
+        });
+
+        return Object.entries(groups)
+          .map(([label, val]) => ({ label, val: Number(val.toFixed(2)) }))
+          .sort((a, b) => b.val - a.val)
+          .slice(0, 15);
+      }, [activeDataset, filteredRows, xAxisCol, yAxisCol]);
+
+      // Render Chart canvas using Chart.js
+      const chartRef = useRef(null);
+      const chartInstanceRef = useRef(null);
+
+      useEffect(() => {
+        if (currentTab === 'dashboard' && chartRef.current && chartData.length > 0) {
+          if (chartInstanceRef.current) chartInstanceRef.current.destroy();
+
+          const ctx = chartRef.current.getContext('2d');
+          chartInstanceRef.current = new Chart(ctx, {
+            type: chartType === 'donut' ? 'doughnut' : chartType,
+            data: {
+              labels: chartData.map(d => d.label),
+              datasets: [{
+                label: `${yAxisCol} حسب ${xAxisCol}`,
+                data: chartData.map(d => d.val),
+                backgroundColor: ['#0d9488', '#6366f1', '#f59e0b', '#ec4899', '#3b82f6', '#10b981', '#8b5cf6'],
+                borderWidth: 1
+              }]
+            },
+            options: {
+              responsive: true,
+              maintainAspectRatio: false,
+              plugins: {
+                legend: { position: 'bottom', labels: { font: { family: 'Cairo' } } }
+              }
+            }
+          });
+        }
+      }, [chartData, chartType, currentTab]);
+
+      // Export Handlers
+      const handleExportExcel = () => {
+        if (!activeDataset) return;
+        const ws = XLSX.utils.json_to_sheet(activeDataset.data);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, 'البيانات');
+        XLSX.writeFile(wb, `مستخرج_${activeDataset.fileName}`);
+      };
+
+      const handleExportCSV = () => {
+        if (!activeDataset) return;
+        const csv = Papa.unparse(activeDataset.data);
+        const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = `مستخرج_${activeDataset.name}.csv`;
+        link.click();
+      };
+
+      // Lucide icons re-trigger after state change
+      useEffect(() => {
+        if (window.lucide) window.lucide.createIcons();
+      });
+
+      return e('div', { className: 'min-h-screen flex flex-col font-cairo' }, [
+        // Header
+        e('header', { key: 'header', className: 'bg-slate-900 text-white border-b border-slate-800 sticky top-0 z-30 shadow-md no-print' }, 
+          e('div', { className: 'max-w-7xl mx-auto px-4 h-16 flex items-center justify-between' }, [
+            e('div', { className: 'flex items-center gap-3' }, [
+              e('div', { className: 'bg-teal-600 p-2.5 rounded-xl flex items-center justify-center' }, 
+                e('i', { 'data-lucide': 'bar-chart-3', className: 'w-6 h-6 text-white' })
+              ),
+              e('div', null, [
+                e('h1', { className: 'text-lg font-bold' }, 'منصة تحليل البيانات الذكية'),
+                e('p', { className: 'text-xs text-slate-400' }, 'Data Analysis Studio • نظام التحليل المستقل')
+              ])
+            ]),
+            e('div', { className: 'flex items-center gap-3' }, [
+              datasets.length > 0 && e('button', {
+                onClick: () => setShowMergeModal(true),
+                className: 'flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 px-3.5 py-2 rounded-lg text-sm font-semibold transition'
+              }, [
+                e('i', { 'data-lucide': 'git-merge', className: 'w-4 h-4' }),
+                e('span', null, 'دمج / ربط الملفات')
+              ]),
+              datasets.length > 0 && e('button', {
+                onClick: () => { setDatasets([]); setActiveDatasetId(null); },
+                className: 'flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 px-3 py-2 rounded-lg text-sm font-medium border border-slate-700'
+              }, [
+                e('i', { 'data-lucide': 'refresh-cw', className: 'w-4 h-4' }),
+                e('span', null, 'إعادة ضبط')
+              ])
+            ])
+          ])
+        ),
+
+        // Main Layout
+        e('main', { key: 'main', className: 'flex-1 pb-12' }, [
+          datasets.length === 0 ? 
+            // File Upload Section
+            e('div', { className: 'max-w-3xl mx-auto py-12 px-4' }, [
+              e('div', { className: 'text-center mb-8' }, [
+                e('h2', { className: 'text-3xl font-extrabold text-slate-900 mb-3' }, 'حلل بياناتك بضغطة زر واحدة محلياً 100%'),
+                e('p', { className: 'text-slate-600 text-base' }, 'قم برفع ملفات Excel أو CSV للبدء التلقائي بالتنظيف والإحصاء المتقدم والتقارير التنفيذية.')
+              ]),
+
+              e('label', { className: 'border-2 border-dashed border-slate-300 hover:border-teal-500 rounded-2xl p-10 block text-center bg-white cursor-pointer shadow-sm transition' }, [
+                e('div', { className: 'w-16 h-16 bg-teal-50 text-teal-600 rounded-2xl flex items-center justify-center mx-auto mb-4' },
+                  e('i', { 'data-lucide': 'file-spreadsheet', className: 'w-8 h-8' })
+                ),
+                e('h3', { className: 'text-xl font-bold text-slate-800 mb-2' }, 'اختر الملفات أو اسحبها هنا'),
+                e('p', { className: 'text-slate-500 mb-6 text-sm' }, 'يدعم ملفات Excel (.xlsx, .xls) وملفات CSV (.csv) متعددة'),
+                e('span', { className: 'inline-flex items-center gap-2 bg-teal-600 hover:bg-teal-700 text-white px-6 py-3 rounded-xl font-semibold shadow-lg shadow-teal-600/20' }, [
+                  e('i', { 'data-lucide': 'upload', className: 'w-5 h-5' }),
+                  e('span', null, 'استعراض الجهاز')
+                ]),
+                e('input', {
+                  type: 'file',
+                  multiple: true,
+                  accept: '.xlsx, .xls, .csv',
+                  className: 'hidden',
+                  onChange: (ev) => ev.target.files && handleFileUpload(Array.from(ev.target.files))
+                })
+              ]),
+
+              e('div', { className: 'mt-6 text-center' }, [
+                e('button', {
+                  onClick: handleLoadDemo,
+                  className: 'inline-flex items-center gap-2 text-indigo-600 bg-indigo-50 hover:bg-indigo-100 px-4 py-2 rounded-xl text-sm font-bold transition'
+                }, [
+                  e('i', { 'data-lucide': 'sparkles', className: 'w-4 h-4' }),
+                  e('span', null, 'تعتمد عينة تجريبية للقيام بتجربة فورية')
+                ])
+              ]),
+
+              isLoading && e('div', { className: 'mt-6 text-center bg-white p-6 rounded-xl border border-slate-200' }, [
+                e('div', { className: 'inline-block animate-spin rounded-full h-8 w-8 border-4 border-teal-600 border-t-transparent mb-2' }),
+                e('p', { className: 'font-semibold text-slate-800' }, 'جاري فحص البيانات وبناء الهياكل الإحصائية...')
+              ])
+            ])
+            :
+            // App Active Views
+            e('div', null, [
+              // Dataset Switcher Tabs
+              e('div', { className: 'bg-slate-900 text-slate-300 border-b border-slate-800 no-print' }, [
+                e('div', { className: 'max-w-7xl mx-auto px-4 flex items-center gap-2 overflow-x-auto py-2' }, [
+                  e('span', { className: 'text-xs font-bold text-slate-400 shrink-0' }, 'الملفات النشطة:'),
+                  datasets.map(ds => 
+                    e('button', {
+                      key: ds.id,
+                      onClick: () => setActiveDatasetId(ds.id),
+                      className: `flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold shrink-0 transition ${
+                        ds.id === activeDataset.id ? 'bg-teal-600 text-white' : 'bg-slate-800 hover:bg-slate-700 text-slate-300'
+                      }`
+                    }, [
+                      e('i', { 'data-lucide': 'file-text', className: 'w-3.5 h-3.5' }),
+                      e('span', null, ds.fileName)
+                    ])
+                  )
+                ])
+              ]),
+
+              // Main Navigation Tabs
+              e('div', { className: 'bg-white border-b border-slate-200 mb-6 no-print' }, [
+                e('div', { className: 'max-w-7xl mx-auto px-4 flex space-x-reverse space-x-2' }, 
+                  [
+                    { id: 'dashboard', label: 'لوحة التحليل والتفاعل', icon: 'layout-dashboard' },
+                    { id: 'cleaner', label: 'تنظيف وجودة البيانات', icon: 'sliders' },
+                    { id: 'report', label: 'التقرير التنفيذي الشامل', icon: 'file-spreadsheet' }
+                  ].map(tab => 
+                    e('button', {
+                      key: tab.id,
+                      onClick: () => setCurrentTab(tab.id),
+                      className: `flex items-center gap-2 py-4 px-5 font-semibold text-sm border-b-2 transition ${
+                        currentTab === tab.id ? 'border-teal-600 text-teal-600 bg-teal-50/50' : 'border-transparent text-slate-600 hover:text-slate-900'
+                      }`
+                    }, [
+                      e('i', { 'data-lucide': tab.icon, className: 'w-4 h-4' }),
+                      e('span', null, tab.label)
+                    ])
+                  )
+                )
+              ]),
+
+              // Active Tab Render
+              e('div', { className: 'max-w-7xl mx-auto px-4' }, [
+                // TAB 1: DASHBOARD
+                currentTab === 'dashboard' && e('div', { className: 'space-y-6' }, [
+                  // KPI Cards
+                  e('div', { className: 'grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4' }, [
+                    { title: 'إجمالي السجلات', val: activeDataset.rowCount.toLocaleString('ar-SA'), icon: 'database', bg: 'text-teal-600' },
+                    { title: 'عدد الأعمدة', val: activeDataset.columnCount, icon: 'columns', bg: 'text-indigo-600' },
+                    { title: 'مؤشر الجودة', val: `${activeDataset.qualityScore}%`, icon: 'shield-check', bg: 'text-emerald-600' },
+                    { title: 'القيم المفقودة', val: activeDataset.totalMissing.toLocaleString('ar-SA'), icon: 'alert-triangle', bg: 'text-amber-600' }
+                  ].map((kpi, idx) => 
+                    e('div', { key: idx, className: 'bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex items-center justify-between' }, [
+                      e('div', null, [
+                        e('p', { className: 'text-xs font-medium text-slate-500 mb-1' }, kpi.title),
+                        e('h3', { className: 'text-2xl font-extrabold text-slate-900' }, kpi.val)
+                      ]),
+                      e('div', { className: 'w-12 h-12 bg-slate-50 rounded-xl flex items-center justify-center border border-slate-100' },
+                        e('i', { 'data-lucide': kpi.icon, className: `w-6 h-6 ${kpi.bg}` })
+                      )
+                    ])
+                  )),
+
+                  // Dynamic Chart Builder Panel
+                  e('div', { className: 'bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-4' }, [
+                    e('div', { className: 'flex flex-wrap items-center justify-between gap-4 border-b border-slate-100 pb-4' }, [
+                      e('h3', { className: 'font-bold text-slate-900 text-base flex items-center gap-2' }, [
+                        e('i', { 'data-lucide': 'pie-chart', className: 'w-5 h-5 text-teal-600' }),
+                        e('span', null, 'المحرك البياني التفاعلي')
+                      ]),
+                      e('div', { className: 'flex flex-wrap items-center gap-3' }, [
+                        // Select X Axis
+                        e('select', {
+                          value: xAxisCol,
+                          onChange: (ev) => setXAxisCol(ev.target.value),
+                          className: 'bg-slate-50 border border-slate-300 rounded-lg px-3 py-1.5 text-xs font-semibold'
+                        }, activeDataset.columns.map(c => e('option', { key: c.name, value: c.name }, `المحور الأفقي: ${c.name}`))),
+
+                        // Select Y Axis
+                        e('select', {
+                          value: yAxisCol,
+                          onChange: (ev) => setYAxisCol(ev.target.value),
+                          className: 'bg-slate-50 border border-slate-300 rounded-lg px-3 py-1.5 text-xs font-semibold'
+                        }, activeDataset.columns.filter(c => c.type === 'number').map(c => e('option', { key: c.name, value: c.name }, `المحور الرأسي: ${c.name}`))),
+
+                        // Select Chart Type
+                        e('select', {
+                          value: chartType,
+                          onChange: (ev) => setChartType(ev.target.value),
+                          className: 'bg-slate-50 border border-slate-300 rounded-lg px-3 py-1.5 text-xs font-semibold'
+                        }, [
+                          e('option', { value: 'bar' }, 'شريطي العمودي'),
+                          e('option', { value: 'line' }, 'خطي (التطور الزمني)'),
+                          e('option', { value: 'pie' }, 'دائري (Pie)'),
+                          e('option', { value: 'donut' }, 'حلقي (Donut)')
+                        ])
+                      ])
+                    ]),
+
+                    e('div', { className: 'h-80 relative' }, [
+                      e('canvas', { ref: chartRef })
+                    ])
+                  ]),
+
+                  // Interactive Data Table
+                  e('div', { className: 'bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden' }, [
+                    e('div', { className: 'p-4 border-b border-slate-200 flex items-center justify-between gap-4' }, [
+                      e('h3', { className: 'font-bold text-slate-900 text-sm' }, 'استعراض البيانات المفلترة'),
+                      e('input', {
+                        type: 'text',
+                        placeholder: 'بحث في البيانات...',
+                        value: searchTerm,
+                        onChange: (ev) => setSearchTerm(ev.target.value),
+                        className: 'bg-slate-50 border border-slate-300 rounded-lg px-3 py-1.5 text-xs w-64'
+                      })
+                    ]),
+                    e('div', { className: 'overflow-x-auto max-h-80' }, [
+                      e('table', { className: 'w-full text-right border-collapse text-xs' }, [
+                        e('thead', { className: 'bg-slate-50 font-bold sticky top-0 border-b border-slate-200 text-slate-700' }, [
+                          e('tr', null, [
+                            e('th', { className: 'p-3' }, '#'),
+                            activeDataset.columns.map(c => e('th', { key: c.name, className: 'p-3' }, c.name))
+                          ])
+                        ]),
+                        e('tbody', { className: 'divide-y divide-slate-100 text-slate-700' }, 
+                          filteredRows.slice(0, 50).map((row, rIdx) => 
+                            e('tr', { key: rIdx, className: 'hover:bg-slate-50' }, [
+                              e('td', { className: 'p-3 text-slate-400 font-mono' }, rIdx + 1),
+                              activeDataset.columns.map(c => e('td', { key: c.name, className: 'p-3 max-w-xs truncate' }, String(row[c.name] ?? '-')))
+                            ])
+                          )
+                        )
+                      ])
+                    ])
+                  ])
+                ]),
+
+                // TAB 2: CLEANER
+                currentTab === 'cleaner' && e('div', { className: 'max-w-3xl mx-auto bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-6' }, [
+                  e('h3', { className: 'text-lg font-bold text-slate-900 border-b border-slate-100 pb-3' }, 'خيارات تنظيف البيانات وإعادة التحليل'),
+                  e('div', { className: 'space-y-4' }, [
+                    e('label', { className: 'flex items-center gap-3 p-4 bg-slate-50 rounded-xl border border-slate-200 cursor-pointer' }, [
+                      e('input', { type: 'checkbox', defaultChecked: true, id: 'chk_dup', className: 'w-5 h-5 text-teal-600 rounded' }),
+                      e('div', null, [
+                        e('span', { className: 'font-bold text-slate-800 text-sm block' }, 'حذف الصفوف المكررة تماماً'),
+                        e('span', { className: 'text-xs text-slate-500' }, `تم رصد ${activeDataset.duplicatesCount} صفوف مكررة في البيانات الحالية.`)
+                      ])
+                    ]),
+                    e('label', { className: 'flex items-center gap-3 p-4 bg-slate-50 rounded-xl border border-slate-200 cursor-pointer' }, [
+                      e('input', { type: 'checkbox', defaultChecked: true, id: 'chk_miss', className: 'w-5 h-5 text-teal-600 rounded' }),
+                      e('div', null, [
+                        e('span', { className: 'font-bold text-slate-800 text-sm block' }, 'معالجة القيم الفارغة بالمعدلات الإحصائية'),
+                        e('span', { className: 'text-xs text-slate-500' }, `استبدال الفراغات بالأرقام بـ (Mean) وفي النصوص بـ ("غير محدد").`)
+                      ])
+                    ])
+                  ]),
+                  e('button', {
+                    onClick: () => handleCleanData({
+                      removeDuplicates: document.getElementById('chk_dup').checked,
+                      handleMissing: document.getElementById('chk_miss').checked
+                    }),
+                    className: 'w-full bg-teal-600 hover:bg-teal-700 text-white font-bold py-3 rounded-xl transition shadow-lg shadow-teal-600/20'
+                  }, 'تطبيق المعالجة وتحديث الإحصائيات')
+                ]),
+
+                // TAB 3: EXECUTIVE REPORT
+                currentTab === 'report' && e('div', { className: 'max-w-4xl mx-auto space-y-6' }, [
+                  e('div', { className: 'flex justify-between items-center bg-white p-4 rounded-xl border border-slate-200 no-print' }, [
+                    e('span', { className: 'text-sm font-bold text-slate-700' }, 'التقرير الشامل جاهز للتصدير أو الطباعة'),
+                    e('div', { className: 'flex gap-2' }, [
+                      e('button', { onClick: handleExportExcel, className: 'bg-emerald-600 hover:bg-emerald-700 text-white px-3.5 py-2 rounded-lg text-xs font-semibold' }, 'تصدير Excel'),
+                      e('button', { onClick: handleExportCSV, className: 'bg-blue-600 hover:bg-blue-700 text-white px-3.5 py-2 rounded-lg text-xs font-semibold' }, 'تصدير CSV'),
+                      e('button', { onClick: () => window.print(), className: 'bg-slate-800 hover:bg-slate-700 text-white px-3.5 py-2 rounded-lg text-xs font-semibold' }, 'طباعة التقرير PDF')
+                    ])
+                  ]),
+
+                  // Printable Page Document
+                  e('div', { className: 'bg-white p-10 rounded-2xl border border-slate-200 shadow-sm space-y-8' }, [
+                    e('div', { className: 'border-b border-slate-200 pb-4' }, [
+                      e('h2', { className: 'text-2xl font-extrabold text-slate-900 mb-1' }, `تقرير تحليل البيانات الشامل`),
+                      e('p', { className: 'text-xs text-slate-500' }, `اسم الملف: ${activeDataset.fileName} • تاريخ التقرير: ${new Date().toLocaleDateString('ar-SA')}`)
+                    ]),
+
+                    e('div', { className: 'space-y-2' }, [
+                      e('h4', { className: 'font-bold text-slate-800 border-r-4 border-teal-600 pr-2' }, '1. الملخص التنفيذي والجودة'),
+                      e('p', { className: 'text-xs text-slate-600 leading-relaxed' }, 
+                        `يحتوي هذا التقرير على تحليل شامل لـ ${activeDataset.rowCount} سجل عبر ${activeDataset.columnCount} أعمدة. وصل مؤشر جودة البيانات الإجمالي إلى ${activeDataset.qualityScore}% مع وجود ${activeDataset.totalMissing} قيمة مفقودة و${activeDataset.duplicatesCount} سجل مكرر.`
+                      )
+                    ]),
+
+                    e('div', { className: 'space-y-3' }, [
+                      e('h4', { className: 'font-bold text-slate-800 border-r-4 border-teal-600 pr-2' }, '2. الإحصائيات الوصفية الدقيقة للأعمدة الرقمية'),
+                      e('div', { className: 'overflow-x-auto' }, [
+                        e('table', { className: 'w-full text-right border-collapse text-xs' }, [
+                          e('thead', { className: 'bg-slate-100 font-bold' }, [
+                            e('tr', null, [
+                              e('th', { className: 'p-2' }, 'العمود'),
+                              e('th', { className: 'p-2' }, 'المجموع'),
+                              e('th', { className: 'p-2' }, 'المتوسط (Mean)'),
+                              e('th', { className: 'p-2' }, 'الوسيط (Median)'),
+                              e('th', { className: 'p-2' }, 'الانحراف المعياري'),
+                              e('th', { className: 'p-2' }, 'القيم الشاذة')
+                            ])
+                          ]),
+                          e('tbody', { className: 'divide-y divide-slate-100' }, 
+                            activeDataset.columns.filter(c => c.type === 'number' && c.stats).map(c => 
+                              e('tr', { key: c.name }, [
+                                e('td', { className: 'p-2 font-bold' }, c.name),
+                                e('td', { className: 'p-2' }, c.stats.sum.toLocaleString('ar-SA')),
+                                e('td', { className: 'p-2' }, c.stats.mean.toFixed(2)),
+                                e('td', { className: 'p-2' }, c.stats.median.toFixed(2)),
+                                e('td', { className: 'p-2' }, c.stats.stdDev.toFixed(2)),
+                                e('td', { className: 'p-2 text-amber-600 font-bold' }, c.stats.outliersCount)
+                              ])
+                            )
+                          )
+                        ])
+                      ])
+                    ])
+                  ])
+                ])
+              ])
+            ]),
+        ])
+      ]);
+    }
+
+    // Render Root
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(e(App));
+  </script>
+</body>
+</html>
